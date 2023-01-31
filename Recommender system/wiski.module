@@ -1,0 +1,224 @@
+<?php
+
+/**
+* Element validator (for repeat until correct).
+*/
+function wiski_element_validate(&$element, &$form_state) {
+  $question_nid = $element['#array_parents'][1];
+  $current_question = node_load($question_nid);
+  $quiz = node_load($form_state['complete form']['#quiz']['nid'], $form_state['complete form']['#quiz']['vid']);
+
+  if ($form_state['clicked_button']['#value'] == 'Vraag hulp') {
+    rules_invoke_event('hulppagina_bekeken_tijdens_quiz', $current_question, $quiz);
+  } else {
+    $answer = $form_state['values']['question'][$question_nid]['answer'];
+
+    // There was an answer submitted.
+    $result = _quiz_question_response_get_instance($_SESSION['quiz'][$quiz->nid]['result_id'], $current_question, $answer);
+
+    // Fout antwoord
+    if (!$result->isCorrect() && $result->isEvaluated()) {
+      // Verander status naar FALSE.
+      form_error($element, t(''));
+      $form_state['correct'] = FALSE;
+      // Roep regel op
+      $quiz_result_answer = entity_load_single('quiz_result_answer', $result->result_answer_id);
+      rules_invoke_event('meerkeuzevraag_fout_beantwoord', $quiz_result_answer);
+    }
+  }
+}
+
+/**
+ * Create exercise series of 3 exercises, chosen such that the probability for solving them
+ * correctly is closest to 0.7 for the logged in user.
+ */
+function wiski_build_question_list_elo($quiz) {
+  global $user;
+  $terms = _quiz_get_terms($quiz->vid);
+  $questions = array();
+  $nids = array();
+  $question_types = array_keys(quiz_get_question_types());
+  if (empty($question_types)) {
+    return array();
+  }
+  $total_count = 0;
+  foreach ($terms as $term) {
+
+    $query = db_select('node', 'n');
+    $query->join('taxonomy_index', 'tn', 'n.nid = tn.nid');
+    $query->fields('n', array('nid', 'vid', 'type'));
+    $query->fields('tn', array('tid'));
+    $query->condition('n.status', 1, '=');
+    $query->condition('n.type', $question_types, 'IN');
+    $query->condition('tn.tid', $term->tid, '=');
+    if (!empty($nids)) {
+      $query->condition('n.nid', $nids, 'NOT IN');
+    }
+    $query->orderBy('RAND()');
+    $query->addTag('quiz_build_categorized_questions');
+
+    $result = $query->execute();
+    $count = 0;
+    while ($question = $result->fetchAssoc()) {
+      $count++;
+      $question['tid'] = $term->tid;
+      $question['number'] = $count + $total_count;
+      $questions[] = $question;
+      $nids[] = $question['nid'];
+    }
+    $total_count += $count;
+  }
+
+  $count = 0;
+  $display_count = 0;
+  $questions_out = array();
+  foreach ($questions as &$question) {
+    $question_node = node_load($question['nid'], $question['vid']);
+    $count++;
+    $display_count++;
+    $question['number'] = $count;
+    if ($question['type'] != 'quiz_page') {
+      $question['display_number'] = $display_count;
+    }
+    $questions_out[$count] = $question;
+  }
+
+  $elo_difference = array(2,3);
+  $elo_questions = array($questions_out[1], $questions_out[2]);
+  $max = 0;
+
+  //$questions_out zijn alle vragen die bij de gegeven quiz horen
+  for ($i = 1; $i <= count($questions_out); $i++) {
+    //berekenen variabelen
+    $vid = $questions_out[$i]["vid"];
+    $nid = $questions_out[$i]["nid"];
+    $level_question = db_query('SELECT level FROM {quiz_question_properties} WHERE vid = :vid AND nid = :nid', array(":vid" => $vid, ":nid" => $nid))->fetchField();
+    $level_user = userpoints_get_current_points($user->uid);
+    $in = -($level_user-$level_question)/400;
+    $kans_correct = 1/(1+pow(10,$in));
+    $difference = abs($kans_correct-0.7);
+    if ($i == 1) {
+      $elo_difference[0] = $difference;
+      $max = $difference;
+    } elseif ($i == 2) {
+      $elo_difference[1] = $difference;
+      if ($difference > $max) {
+        $max = $difference;
+      }
+    } else {
+      if ($difference < $elo_difference[0] || $difference < $elo_difference[1]) {
+        if ($elo_difference[0] == $max) {
+          $elo_difference[0] = $difference;
+          $elo_questions[0] = $questions_out[$i];
+
+          if ($difference > $elo_difference[1]) {
+              $max = $difference;
+          } else {
+              $max = $elo_difference[1];
+          }
+
+        } elseif ($elo_difference[1] == $max) {
+          $elo_difference[1] = $difference;
+          $elo_questions[1] = $questions_out[$i];
+
+          if ($difference > $elo_difference[0]) {
+              $max = $difference;
+          } else {
+              $max = $elo_difference[0];
+          }
+        } 
+      }
+    }
+  }
+
+  /**  3 vragen
+  $elo_difference = array(2,3,4);
+  $elo_questions = array($questions_out[1], $questions_out[2],$questions_out[3]);
+  $max = 0;
+
+  //$questions_out zijn alle vragen die bij de gegeven quiz horen
+  for ($i = 1; $i <= count($questions_out); $i++) {
+    //berekenen variabelen
+    $vid = $questions_out[$i]["vid"];
+    $nid = $questions_out[$i]["nid"];
+    $level_question = db_query('SELECT level FROM {quiz_question_properties} WHERE vid = :vid AND nid = :nid', array(":vid" => $vid, ":nid" => $nid))->fetchField();
+    $level_user = userpoints_get_current_points($user->uid);
+    $in = -($level_user-$level_question)/400;
+    $kans_correct = 1/(1+pow(10,$in));
+    $difference = abs($kans_correct-0.7);
+    if ($i == 1) {
+      $elo_difference[0] = $difference;
+      $max = $difference;
+    } elseif ($i == 2) {
+      $elo_difference[1] = $difference;
+      if ($difference > $max) {
+        $max = $difference;
+      }
+    } elseif ($i == 3) {
+      $elo_difference[2] = $difference;
+      if ($difference > $max) {
+        $max = $difference;
+      }
+    } else {
+      if ($difference < $elo_difference[0] || $difference < $elo_difference[1] || $difference < $elo_difference[2]) {
+        if ($elo_difference[0] == $max) {
+          $elo_difference[0] = $difference;
+          $elo_questions[0] = $questions_out[$i];
+
+          if ($difference > $elo_difference[1]) {
+            if ($difference > $elo_difference[2]){
+              $max = $difference;
+            } else {
+              $max = $elo_difference[2];
+            }
+          } else {
+            if ($elo_difference[1] > $elo_difference[2]) {
+              $max = $elo_difference[1];
+            } else {
+              $max = $elo_difference[2];
+            }
+          }
+
+        } elseif ($elo_difference[1] == $max) {
+          $elo_difference[1] = $difference;
+          $elo_questions[1] = $questions_out[$i];
+
+          if ($difference > $elo_difference[0]) {
+            if ($difference > $elo_difference[2]){
+              $max = $difference;
+            } else {
+              $max = $elo_difference[2];
+            }
+          } else {
+            if ($elo_difference[0] > $elo_difference[2]) {
+              $max = $elo_difference[0];
+            } else {
+              $max = $elo_difference[2];
+            }
+          }
+
+        } elseif ($elo_difference[2] == $max) {
+          $elo_difference[2] = $difference;
+          $elo_questions[2] = $questions_out[$i];
+
+          if ($difference > $elo_difference[0]) {
+            if ($difference > $elo_difference[1]){
+              $max = $difference;
+            } else {
+              $max = $elo_difference[1];
+            }
+          } else {
+            if ($elo_difference[0] > $elo_difference[1]) {
+              $max = $elo_difference[0];
+            } else {
+              $max = $elo_difference[1];
+            }
+          }
+
+        }
+      }
+    }
+  }*/
+
+  return $elo_questions;
+}
